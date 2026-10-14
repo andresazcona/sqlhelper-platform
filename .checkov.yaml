@@ -1,0 +1,37 @@
+# Every skip is a deliberate decision, documented here and in the README.
+framework:
+  - terraform
+skip-path:
+  - .terraform
+skip-check:
+  # ALB is internal and only reached by the CloudFront VPC origin over the AWS
+  # network; viewer TLS terminates at CloudFront. The SG rule source is the
+  # CloudFront origin-facing prefix list, not 0.0.0.0/0.
+  - CKV_AWS_2
+  - CKV_AWS_103
+  - CKV_AWS_378
+  - CKV2_AWS_20
+  - CKV_AWS_260
+  # KMS customer-managed keys: AWS-owned encryption is enough for a public,
+  # stateless app holding no user data. SNS: CloudWatch cannot publish to a
+  # topic encrypted with the aws/sns managed key.
+  - CKV_AWS_136
+  - CKV_AWS_145
+  - CKV_AWS_158
+  - CKV_AWS_26
+  # Cost: access logs, flow logs, replication and event notifications are on
+  # the "next" list; they add spend without changing this app's risk profile.
+  - CKV_AWS_18
+  - CKV_AWS_86
+  - CKV_AWS_91
+  - CKV_AWS_144
+  - CKV2_AWS_11
+  - CKV2_AWS_62
+  # WAF with a rate-based rule is the first item on the "next" list (see README).
+  - CKV_AWS_68
+  - CKV2_AWS_47
+  # Public tool for a global audience; single static origin, nothing to fail over to.
+  - CKV_AWS_374
+  - CKV_AWS_310
+  # The first two available AZs are taken by name; the stack is region-portable.
+  - CKV_AWS_394
