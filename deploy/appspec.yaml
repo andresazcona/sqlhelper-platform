@@ -1,0 +1,11 @@
+# CodeDeploy AppSpec for the API. <TASK_DEFINITION> is filled in by
+# aws-actions/amazon-ecs-deploy-task-definition with the new revision ARN.
+version: 0.0
+Resources:
+  - TargetService:
+      Type: AWS::ECS::Service
+      Properties:
+        TaskDefinition: <TASK_DEFINITION>
+        LoadBalancerInfo:
+          ContainerName: api
+          ContainerPort: 3000

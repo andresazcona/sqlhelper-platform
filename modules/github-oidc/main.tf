@@ -120,7 +120,7 @@ data "aws_iam_policy_document" "deploy" {
 
   statement {
     sid       = "FrontendWrite"
-    actions   = ["s3:PutObject", "s3:DeleteObject"]
+    actions   = ["s3:PutObject"]
     resources = ["${var.frontend_bucket_arn}/*"]
   }
 

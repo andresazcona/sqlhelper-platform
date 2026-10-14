@@ -1,0 +1,155 @@
+name: deploy
+
+# Builds SQLhelper at a given ref and releases it to one environment:
+#   API      -> docker build (arm64) -> ECR -> new task definition -> CodeDeploy blue/green
+#   Frontend -> vite build -> S3 sync -> CloudFront invalidation
+#
+# Every AWS call uses GitHub OIDC; there are no stored AWS keys. Each GitHub
+# environment (dev, staging, prod) holds the outputs of `terraform output
+# github_environment_variables`. Without AWS_ROLE_ARN the workflow does nothing.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, staging, prod]
+        required: true
+      app_ref:
+        description: Git ref of andresazcona/SQLhelper to deploy
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  APP_REPOSITORY: andresazcona/SQLhelper
+  AWS_REGION: us-east-1
+  NAME: sqlhelper-${{ inputs.environment }}
+
+jobs:
+  # Environment-scoped variables are not visible in a job-level `if`,
+  # so a tiny job inside the environment decides whether to go on.
+  preflight:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        run: |
+          if [ -n "${{ vars.AWS_ROLE_ARN }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::AWS_ROLE_ARN is not set for '${{ inputs.environment }}'; skipping deploy."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  api:
+    needs: preflight
+    if: needs.preflight.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04-arm # native arm64 build for Graviton Fargate tasks
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7 # appspec.yaml
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.APP_REPOSITORY }}
+          ref: ${{ inputs.app_ref }}
+          path: app
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - id: image
+        name: Build and push image
+        run: |
+          sha=$(git -C app rev-parse --short=12 HEAD)
+          image="${{ steps.ecr.outputs.registry }}/sqlhelper-api:${sha}-${{ github.run_number }}"
+          docker build -t "$image" app/SQLhelper-back
+          docker push "$image"
+          echo "uri=$image" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch current task definition
+        run: |
+          aws ecs describe-task-definition --task-definition "$NAME-api" \
+            --query taskDefinition > taskdef.json
+
+      - id: taskdef
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: taskdef.json
+          container-name: api
+          image: ${{ steps.image.outputs.uri }}
+
+      - name: Blue/green release via CodeDeploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.taskdef.outputs.task-definition }}
+          cluster: ${{ env.NAME }}
+          service: ${{ env.NAME }}-api
+          codedeploy-appspec: deploy/appspec.yaml
+          codedeploy-application: ${{ env.NAME }}-api
+          codedeploy-deployment-group: ${{ env.NAME }}-api
+          wait-for-service-stability: true # fails the job if CodeDeploy rolls back
+
+  frontend:
+    needs: api # the new SPA only goes live once its API is serving
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: app/SQLhelper-front
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.APP_REPOSITORY }}
+          ref: ${{ inputs.app_ref }}
+          path: app
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/SQLhelper-front/package-lock.json
+
+      - name: Build
+        run: npm ci && npm run build
+        env:
+          VITE_API_URL: /api # same origin: CloudFront routes /api/* to the ALB
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload to S3
+        run: |
+          # Hashed assets are immutable and never deleted, so tabs still running the
+          # previous build keep loading their chunks. index.html is always revalidated.
+          aws s3 sync dist "s3://${{ vars.FRONTEND_BUCKET }}" \
+            --exclude index.html --cache-control "public, max-age=31536000, immutable"
+          aws s3 cp dist/index.html "s3://${{ vars.FRONTEND_BUCKET }}/index.html" \
+            --cache-control "no-cache"
+
+      - name: Invalidate index.html
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}" --paths "/index.html"
